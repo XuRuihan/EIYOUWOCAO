@@ -1,54 +1,65 @@
 import json
 import random
 from MahjongGB import MahjongFanCalculator
-
 """某个运行实例的输入。每行代表一个step
-{"requests":["0 0 3"],"responses":[]}
-{"requests":["0 0 3","1 0 0 0 0 B2 B1 B1 J2 J3 W2 T5 W2 F1 T3 F4 T8 F2"],"responses":["PASS"]}
-{"requests":["0 0 3","1 0 0 0 0 B2 B1 B1 J2 J3 W2 T5 W2 F1 T3 F4 T8 F2","2 F2"],"responses":["PASS","PASS"]}
-{"requests":["0 0 3","1 0 0 0 0 B2 B1 B1 J2 J3 W2 T5 W2 F1 T3 F4 T8 F2","2 F2","3 0 PLAY F1"],"responses":["PASS","PASS","PLAY F1"]}
-{"requests":["0 0 3","1 0 0 0 0 B2 B1 B1 J2 J3 W2 T5 W2 F1 T3 F4 T8 F2","2 F2","3 0 PLAY F1","3 1 DRAW"],"responses":["PASS","PASS","PLAY F1","PASS"]}
 {"requests":["0 0 3","1 0 0 0 0 B2 B1 B1 J2 J3 W2 T5 W2 F1 T3 F4 T8 F2","2 F2","3 0 PLAY F1","3 1 DRAW","3 1 PLAY T4"],"responses":["PASS","PASS","PLAY F1","PASS","PASS"]}
 """
 
-# 算番函数
-'''
-((value,descripthon),...) MahjongFanCalculator(
-    pack=((packType,tileCode,data),...),
-    hand=(tileCode,...),
-    winTile,
-    flowerCount,
-    isZIMO,
-    isJUEZHANG,
-    isGANG,
-    isLAST,
-    menFeng,
-    quanFeng)
-'''
-
 # 定义 request 常量
-DRAW_AND_PLAY = "2"
+SELF_DRAW = "2"
+OTHERS_TURN = "3"
 
 
 class Mahjong():
     def __init__(self):
-        self.turnID = -1
-        self.playerID = 0
-        self.quan = 0
-        self.hand = []
+        self.reset()
 
     def reset(self):  # 用于后期训练 RL 模型的接口
         self.turnID = -1
-        self.playerID = 0
-        self.quan = 0
-        self.hand = []
+        self.menFeng = 0
+        self.quanFeng = 0
 
-    def getState(self):  # 读取数据并转换成当前状态
+        self.pack = []  # ((packType, tileCode, data), ...),
+        self.hand = []
+        # self.gang = []  # (牌代码, 1 上家供牌 / 2 对家供牌 / 3 下家供牌)
+        # self.peng = []  # 同上
+        # self.chi = []  # (中间牌代码, 第 1 / 2 / 3 张是上家供牌)
+
+        self.play = {}  # 记录已经打出的牌
+        self.left = 88  # 初始牌墙中的牌数
+
+    def calculateFan(self, state):
+        try:
+            fans = MahjongFanCalculator(
+                self.pack,  # 明牌
+                self.hand,  # 暗牌
+                state["tileCode"],  # 和的那张牌
+                0,  # 补花数，在本模型中应当设为 0
+                state["SELF_DRAW"],  # 自摸
+                state["isJUEZHANG"],  # 绝张
+                state["isGANG"],  # 抢杠和/杠上开花
+                state["isLAST"],  # 牌墙最后一张，妙手回春/海底捞月
+                self.menFeng,  # 门风
+                self.quanFeng,  # 圈风
+            )
+            totalFan = sum(fan[0] for fan in fans)  # fan[0] 为番数，fan[1] 为番形名称
+            return totalFan
+        except Exception as e:
+            return 0  # 表示没有赢，因此番数为 0
+
+    def review(self):
+        '''根据输入的 request 复盘
+        Args:
+            命令行输入
+        Return:
+            字符串列表，为当前输入的 request 的切分
+        '''
         inputJson = json.loads(input())
         requests, responses = inputJson["requests"], inputJson["responses"]
         self.turnID = len(responses)
-        if self.turnID == 0:  # 未知作用
-            _, self.playerID, self.quan = tuple(map(int, requests[0].split()))
+        if self.turnID == 0:  # 记录 playerID 和 quan （playerID和门风是否相同？）
+            _, self.menFeng, self.quanFeng = tuple(
+                map(int, requests[0].split()))
         elif self.turnID == 1:  # 起始手牌，只有在跨回合运行的bot中才能用上
             self.hand = requests[1].split()[5:18]
         else:
@@ -56,19 +67,58 @@ class Mahjong():
             for i in range(2, self.turnID):
                 req = requests[i].split()
                 res = responses[i].split()
-                if req[0] == DRAW_AND_PLAY:  # 摸牌
+                if req[0] == SELF_DRAW:  # 摸牌
+                    self.left -= 1
                     self.hand.append(req[1])
                     self.hand.remove(res[1])
+                elif req[0] == OTHERS_TURN:
+                    if req[2] == "PLAY":
+                        # 记录打出的牌
+                        self.play[req[3]] = self.play.get(req[3], 0) + 1
+                    elif req[2] == "DRAW":
+                        self.left -= 1
         req = requests[-1].split()  # 当前回合输入
         return req
 
-    def getAction(self, req):
+    def getState(self):  # 读取数据并转换成当前状态
+        '''获取当前对局状态
+        Args:
+            命令行输入
+        Return:
+            字典，包含当前 request 解析后的状态
+        '''
+        req = self.review()  # 复盘之前的状态
+        # 以下获取当前的状态
+        state = {
+            "SELF_DRAW": False,  # 当前是否摸牌
+            "OTHERS_PLAY": False,  # 当前是否有其他人出牌（需要判断碰/杠/吃/和）
+            "tileCode": "",  # 牌形
+            "isJUEZHANG": False,  # 绝张
+            "isGANG": False,  # 杠
+            "isLAST": False,  # 最后一张
+        }
+        if req[0] == SELF_DRAW:
+            state["SELF_DRAW"] = True
+            state["tileCode"] == req[1]
+            state["isZIMO"] == True
+            state["isJUEZHANG"] = (self.play.get(req[1]) == 3)
+            state["isLAST"] = (self.left == 1)
+        elif req[0] == OTHERS_TURN:
+            if req[2] == "PLAY" and req[1] != self.menFeng:
+                state["tileCode"] == req[3]
+                state["OTHERS_PLAY"] == True
+        return state
+
+    def getAction(self, state):
         if self.turnID < 2:
             return "PASS"
-        if req[0] == DRAW_AND_PLAY:
+        if state["SELF_DRAW"]:  # 自摸
             playCard = random.choice(self.hand)
             return "PLAY " + playCard
-        else:
+        elif state["OTHERS_PLAY"]:  # 其他家出牌
+            ### TODO
+            return "PASS"
+        else:  # 否则无需采取行动
             return "PASS"
 
     # 合法性检查
@@ -109,8 +159,8 @@ class Mahjong():
             raise Exception("Unknown response")
 
     def step(self):
-        state = self.getState()
-        action = self.getAction(state)
+        currState = self.getState()
+        action = self.getAction(currState)
         print(json.dumps({"response": action}))
 
 
