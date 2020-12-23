@@ -38,9 +38,11 @@ class Reader(threading.Thread):
 
     def run(self):
         self.rounds = []
-        self.removed = 0
+        self.removed_hua = 0
+        self.removed_cuohu = 0
+        self.removed_fan = 0
         for filenum, file in enumerate(self.files):
-            if filenum % 100 == 0:
+            if filenum % 1000 == 0:
                 print('{}/{}'.format(filenum, len(self.files)))
             with open(file, encoding='utf-8') as f:
                 line = f.readline()
@@ -53,6 +55,7 @@ class Reader(threading.Thread):
                 score = 0
                 fname = file
                 flag = True
+                already_hu = False
                 while line:
                     # print(line)
                     line = line.strip('\n').split('\t')
@@ -60,6 +63,26 @@ class Reader(threading.Thread):
                         # print(line)
                         outcome = line[-1]
                         fanxing = list(map(lambda x: x.strip("'"), line[2].strip('[]').split(',')))
+                        if outcome != '荒庄':
+                            fanshu = 0
+                            for fan in fanxing:
+                                try:
+                                    description, this_score = fan.split('-')
+                                except:
+                                    description = fan
+                                    if description == '全带五':
+                                        this_score = 16
+                                    elif description == '三同刻':
+                                        this_score = 16
+                                    else:
+                                        print(fan)
+                                if description == '花牌':
+                                    continue
+                                fanshu += int(this_score)
+                            if fanshu < 8:
+                                flag = False
+                                self.removed_fan += 1
+                                break
                         score = int(line[1])
                         # quan = line[0]
                         # print(fanxing)
@@ -69,10 +92,11 @@ class Reader(threading.Thread):
                         cards = line[1]
                         cards = list(map(lambda x: x.strip("'"), cards.strip('[]').split(',')))
                         if len(cards) == 14:
-                            draw_card = cards.pop()
+                            draw_card = cards[-1]
                             for card in cards:
                                 if 'H' in card:
                                     draw_card = card
+                            cards.remove(draw_card)
                             zhuangjia = playerID
                         else:
                             draw_card = None
@@ -110,7 +134,7 @@ class Reader(threading.Thread):
                                     print(fname)
                                 responses[i].pop()
                             if not flag:
-                                self.removed += 1
+                                self.removed_hua += 1
                                 break
                             line = f.readline()
                             if not line:
@@ -130,6 +154,8 @@ class Reader(threading.Thread):
                             card = list(map(lambda x: x.strip("'"), cards.strip('[]').split(',')))[0]
                             _cards = [card]
                             _action = action
+                            if action == '和牌':
+                                already_hu = True
                         for i in range(4):
                             request = get_request(_action, playerID, _cards, i)
                             # print(request)
@@ -142,6 +168,12 @@ class Reader(threading.Thread):
                                 responses[i].append(response)
 
                     line = f.readline()
+                    # 胡牌之后就没有了
+                    if line and already_hu:
+                        self.removed_cuohu += 1
+                        flag = False
+                        # print(fname)
+                        break
                     if not line:
                         for i in range(4):
                             requests[i].pop()
@@ -158,9 +190,9 @@ class Reader(threading.Thread):
                     self.rounds.append(round(outcome, fanxing, score, fname, zhuangjia, requests, responses))
 
     def get_res(self):
-        with open('Tread {}-mini.json'.format(self.id), 'w') as file_obj:
+        with open('training_data/Tread {}-mini.json'.format(self.id), 'w') as file_obj:
             json.dump(self.rounds, file_obj)
-        return self.removed
+        return self.removed_hua, self.removed_cuohu, self.removed_fan
 
 def get_request(action, playerid, cards, myplayerid):
     playerid = str(playerid)
@@ -211,7 +243,9 @@ def get_response(action, playerid, cards, myplayerid):
 
 if __name__ == '__main__':
     #线程数量
-    thread_num = 4
+    thread_num = 16
+    thread_rounds = 4
+    thread_per_round = thread_num // thread_rounds
     #起始时间
     t = []
     folder = 'C:\\Users\\Administrator\\Desktop\\mjdata\\output2017'
@@ -221,17 +255,23 @@ if __name__ == '__main__':
         subfolder = folder + '/' + dir
         for file in os.listdir(subfolder):
             files.append(subfolder + '/' + file)
-    files = files[:10000]
-    filenum = len(files) // thread_num
+    # files = files[:10000]
+    filenum = len(files)
     #生成线程
     for i in range(thread_num):
-        t.append(Reader(files[filenum*i:filenum*(i+1)], i))
-    #开启线程
-    for i in range(thread_num):
-        t[i].start()
-    sum_rm = 0
-    for i in range(thread_num):
-        t[i].join()
-        sum_rm += t[i].get_res()
-    print(sum_rm)
-    #结束时间
+        t.append(Reader(files[i::thread_num], i))
+    rm_hua = 0
+    rm_cuohu = 0
+    rm_fan = 0
+    for this_round in range(thread_rounds):
+        #开启线程
+        for i in range(thread_per_round):
+            t[i+thread_per_round*this_round].start()
+        for i in range(thread_per_round):
+            t[i+thread_per_round*this_round].join()
+            r_h, r_c, r_f = t[i+thread_per_round*this_round].get_res()
+            rm_hua += r_h
+            rm_cuohu += r_c
+            rm_fan += r_f
+    print("一共{}局记录，其中补花错误{}局，错和{}局，番数不足{}局，训练数据共{}局".format(filenum, rm_hua, rm_cuohu, rm_fan,
+                                                            filenum - rm_hua - rm_cuohu - rm_fan))
