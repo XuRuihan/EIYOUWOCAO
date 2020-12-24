@@ -20,7 +20,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import sys
 import os
-import random
 
 class requests(Enum):
     initialHand = 1
@@ -126,7 +125,7 @@ class MahjongHandler():
     def __init__(self, train, model_path, load_model=False, save_model=True):
         use_cuda = torch.cuda.is_available()
         self.device = torch.device("cuda" if use_cuda else "cpu")
-        print('using ' + str(self.device))
+        # print('using ' + str(self.device))
         self.train = train
         self.model_path = model_path
         self.load_model = load_model
@@ -136,25 +135,18 @@ class MahjongHandler():
         self.total_actions = len(responses) - 1
         self.model = myModel(3, 1, self.total_cards, self.total_actions).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
-        self.best_precision = 0
-        self.batch_size = 50
-        self.print_interval = 100
-        self.save_interval = 5000
-        self.round_count = 0
-        self.match = np.zeros(self.total_actions)
-        self.count = np.zeros(self.total_actions)
         if self.load_model:
-            checkpoint = torch.load(self.model_path)
+            checkpoint = torch.load(self.model_path, map_location='cpu')
             self.model.load_state_dict(checkpoint['model'])
             self.optimizer.load_state_dict(checkpoint['optimizer'])
-            try:
-                self.round_count = checkpoint['progress']
-            except:
-                pass
-            # state = {'model': self.model.state_dict(), 'optimizer': self.optimizer.state_dict()}
-            # torch.save(state, self.model_path, _use_new_zipfile_serialization=False)
         if not train:
             self.model.eval()
+        self.batch_size = 50
+        self.print_interval = 100
+        self.round_count = 0
+        self.match = 0
+        self.count = 0
+        self.best_precision = 0
         self.reset(True)
 
     def reset(self, initial=False):
@@ -169,17 +161,16 @@ class MahjongHandler():
         self.prev_request = ''
         self.an_gang_card = ''
         if not initial:
+            if self.round_count % self.print_interval == 0:
+                # print(self.match / self.count)
+                if self.save_model and self.match / self.count > self.best_precision:
+                    self.best_precision = self.match / self.count
+                    state = {'model': self.model.state_dict(), 'optimizer': self.optimizer.state_dict()}
+                    torch.save(state, self.model_path)
+                self.match = 0
+                self.count = 0
             if len(self.loss) > 0:
                 self.model.train_backward(self.loss, self.optimizer)
-            if self.round_count % self.print_interval == 0:
-                precisions = self.match / self.count
-                for i in range(self.total_actions):
-                    print('{}: {}/{} {:2%}'.format(responses(i).name, self.match[i], self.count[i], precisions[i]))
-                self.match = np.zeros(self.total_actions)
-                self.count = np.zeros(self.total_actions)
-            if self.round_count % self.save_interval == 0:
-                state = {'model': self.model.state_dict(), 'optimizer': self.optimizer.state_dict(), 'progress': self.round_count}
-                torch.save(state, self.model_path, _use_new_zipfile_serialization=False)
         self.round_count += 1
         self.loss = []
 
@@ -187,8 +178,11 @@ class MahjongHandler():
         if fname:
             self.fname = fname
         if request is None:
-            inputJSON = json.loads(input())
-            request = inputJSON['requests'].split(' ')
+            if self.turnID == 0:
+                inputJSON = json.loads(input())
+                request = inputJSON['requests'][0].split(' ')
+            else:
+                request = input().split(' ')
         else:
             request = request.split(' ')
 
@@ -229,19 +223,7 @@ class MahjongHandler():
                 if len(self.loss) >= self.batch_size:
                     self.model.train_backward(self.loss, self.optimizer)
                     self.loss = []
-                resp_name = response.split(' ')[0]
-                resp_target_name = response_target.split(' ')[0]
-                if resp_target_name == 'GANG':
-                    if len(response_target.split(' ')) > 1:
-                        resp_target_name = 'ANGANG'
-                    else:
-                        resp_target_name = 'MINGGANG'
-                if resp_name == 'GANG':
-                    if len(response.split(' ')) > 1:
-                        resp_name = 'ANGANG'
-                    else:
-                        resp_name = 'MINGGANG'
-                self.count[responses[resp_target_name].value] += 1
+                self.count += 1
                 if response == response_target:
                     # hand = []
                     # for ind, cardcnt in enumerate(self.hand_free):
@@ -249,7 +231,7 @@ class MahjongHandler():
                     #         hand.append(self.getCardName(ind))
                     # print(hand, request, available_action_mask)
                     # print(response, response_target)
-                    self.match[responses[resp_name].value] += 1
+                    self.match += 1
         self.prev_request = request
         self.turnID += 1
 
@@ -263,15 +245,17 @@ class MahjongHandler():
     def build_losses(self, action_probs, request, response, card_feats, card_mask, action_mask):
         response = response.split(' ')
         response_name = response[0]
+        if response_name == responses.HU.name:
+            # 能胡不胡，必然有毒
+            if action_mask[responses.HU.value] == 0:
+                self.translate_hand()
+                print(self.fname)
         if response_name == 'GANG':
             if len(response) > 1:
                 response_name = 'ANGANG'
                 self.an_gang_card = response[-1]
             else:
                 response_name = 'MINGGANG'
-        if action_mask[responses[response_name].value] == 0:
-            self.translate_hand()
-            print(self.fname)
         response_target = responses[response_name]
         requires_card = responses.need_cards.value[response_target.value]
         action_target = response_target.value
@@ -441,8 +425,8 @@ class MahjongHandler():
             if str(err) == 'ERROR_NOT_WIN':
                 return 0
             else:
-                print(hand, last_card, self.hand_fixed_data)
-                print(err)
+                # print(hand, last_card, self.hand_fixed_data)
+                # print(err)
                 return 0
         else:
             fan_count = 0
@@ -520,10 +504,10 @@ class MahjongHandler():
                 if playerID == myPlayerID:
                     gangCard = self.an_gang_card
                     # print(gangCard)
-                    if gangCard == '':
-                        print(self.prev_request)
-                        print(request)
-                        print(self.fname)
+                    # if gangCard == '':
+                    #     print(request)
+                    #     print(self.prev_request)
+                    #     print(self.fname)
                     gangCardInd = self.getCardInd(gangCard)
                     # 记录gang来源于哪个玩家（可能来自自己，暗杠）
                     self.hand_fixed_data.append(('GANG', gangCard, 0))
@@ -571,8 +555,8 @@ class MahjongHandler():
 
 
     def getCardInd(self, cardName):
-        if cardName[0] == 'H':
-            print('hua ' + self.fname)
+        # if cardName[0] == 'H':
+        #     print(self.fname)
         return cards[cardName[0]].value + int(cardName[1]) - 1
 
     def getCardName(self, cardInd):
@@ -585,20 +569,19 @@ class MahjongHandler():
         return cards(cardInd).name + str(num)
 
 def train_main():
-    my_bot = MahjongHandler(train=True, model_path='model_result/naive_model', load_model=True, save_model=True)
+    my_bot = MahjongHandler(train=True, model_path='model_result/naive_model', load_model=False, save_model=True)
+    # print(torch.__version__)
+    # print(torch.cuda.is_available())
     count = 0
-    restore_count = my_bot.round_count
-    restore_count = 2000
     trainning_data_files = os.listdir('training_data')
     for fname in trainning_data_files:
         with open('training_data/{}'.format(fname), 'r') as f:
             rounds_data = json.load(f)
-            random.shuffle(rounds_data)
             for round_data in rounds_data:
                 for j in range(4):
                     count += 1
-                    if count < restore_count:
-                        continue
+                    # if count < 2000:
+                    #     continue
                     if count % 500 == 0:
                         print(count)
                     train_requests = round_data["requests"][j]
@@ -606,173 +589,20 @@ def train_main():
                     train_requests.insert(0, first_request)
                     train_responses = ['PASS'] + round_data["responses"][j]
                     for _request, _response in zip(train_requests, train_responses):
-                        my_bot.step(_request, _response, round_data['fname'])
                         # print(_request, _response, round_data['fname'])
-                        # try:
-                        #     my_bot.step(_request, _response, round_data['fname'])
-                        # except Exception as e:
-                        #     print(e)
-                        #     print(round_data['fname'])
+                        try:
+                            my_bot.step(_request, _response, round_data['fname'])
+                        except Exception as e:
+                            print(e)
+                            print(round_data['fname'])
                             # exit(0)
                     my_bot.reset()
 def run_main():
     my_bot = MahjongHandler(train=False, model_path='data/naive_model', load_model=True, save_model=False)
-    my_bot.step(output=True)
-    print('>>>BOTZONE_REQUEST_KEEP_RUNNING<<<')
-    sys.stdout.flush()
+    while True:
+        my_bot.step(output=True)
+        print('>>>BOTZONE_REQUEST_KEEP_RUNNING<<<')
+        sys.stdout.flush()
 
 if __name__ == '__main__':
-    train_main()
-# stmp = ''
-# json_str = input()
-# inputJSON = json.loads(json_str)
-# turnID = len(inputJSON["responses"])
-# request = []
-# response = []
-# for i in range(turnID):
-#     request.append(str(inputJSON["requests"][i]))
-#     response.append(str(inputJSON["responses"][i]))
-#
-# request.append(str(inputJSON["requests"][turnID]))
-#
-# if turnID < 2:
-#     response.append('PASS')
-# else:
-#     itmp, myPlayerID, quan = request[0].split(' ')
-#     hand = []
-#     req = request[1]
-#     req = req.split(' ')
-#     for i in range(5, 18):
-#         hand.append(req[i])
-#     for i in range(2, turnID):
-#         req = request[i].split(' ')
-#         res = response[i].split(' ')
-#         if req[0] == '2':
-#             hand.append(req[1])
-#             hand.remove(res[1])
-#     req = request[turnID].split(' ')
-#     if req[0] == '2':
-#         random.shuffle(hand)
-#         resp = 'PLAY ' + hand[-1]
-#         hand.pop()
-#     else:
-#         resp = 'PASS'
-#     response.append(resp)
-# print(json.dumps({"response": response[turnID]}))
-
-# round = {"outcome": "\u8352\u5e84", "fanxing": ["\u8352\u5e84-0"], "score": 0, "fname": "C:\\Users\\Administrator\\Desktop\\mjdata\\output2017/LIU/2017-01-08-925.txt", "zhuangjia": 1, "requests": [["1 0 0 0 0 W8 T3 B5 W4 T5 T2 W3 W9 T8 B4 W5 T5 B7", "3 0 DRAW", "3 1 PLAY T1", "3 2 DRAW", "3 2 PLAY T2", "3 3 DRAW", "3 3 PLAY W3", "2 W2", "3 0 PLAY T8", "3 1 DRAW", "3 1 PLAY T2", "3 2 DRAW", "3 2 PLAY W2", "3 3 DRAW", "3 3 PLAY T9", "2 T4", "3 0 PLAY B7", "3 1 DRAW", "3 1 PLAY T3", "3 2 DRAW", "3 2 PLAY J3", "3 3 DRAW", "3 3 PLAY B6", "3 0 CHI B5 W2", "3 1 DRAW", "3 1 PLAY T2", "3 2 DRAW", "3 2 PLAY J2", "3 3 DRAW", "3 3 PLAY F3", "2 W4", "3 0 PLAY W4", "3 1 DRAW", "3 1 PLAY T7", "3 2 DRAW", "3 2 PLAY B4", "3 1 PENG F3", "3 2 DRAW", "3 2 PLAY T1", "3 3 DRAW", "3 3 PLAY W1", "2 B2", "3 0 PLAY B2", "3 3 PENG F1", "2 F3", "3 0 PLAY F3", "3 1 DRAW", "3 1 PLAY W1", "3 2 DRAW", "3 2 PLAY B5", "3 3 DRAW", "3 3 PLAY J2", "2 F2", "3 0 PLAY F2", "3 1 PENG F1", "3 2 DRAW", "3 2 PLAY F2", "3 3 DRAW", "3 3 PLAY T9", "2 W4", "3 0 PLAY W4", "3 1 DRAW", "3 1 PLAY F4", "3 2 DRAW", "3 2 PLAY B2", "3 3 DRAW", "3 3 PLAY W3", "2 W9", "3 0 PLAY W9", "3 1 DRAW", "3 1 PLAY W4", "3 2 DRAW", "3 2 PLAY T1", "3 3 DRAW", "3 3 PLAY J3", "2 F4", "3 0 PLAY F4", "3 1 DRAW", "3 1 PLAY B1", "3 2 DRAW", "3 2 PLAY W2", "3 3 DRAW", "3 3 PLAY F4", "2 B1", "3 0 PLAY B1", "3 1 DRAW", "3 1 PLAY W1", "3 2 DRAW", "3 2 GANG", "3 2 DRAW", "3 2 PLAY W1", "3 3 DRAW", "3 3 PLAY F4", "2 T3", "3 0 PLAY T3", "3 1 DRAW", "3 1 PLAY J3", "3 2 DRAW", "3 2 PLAY F1", "3 3 DRAW", "3 3 PLAY T8", "2 T8", "3 0 PLAY T8", "3 1 DRAW", "3 1 PLAY W5", "3 2 DRAW", "3 2 PLAY W6", "3 3 DRAW", "3 3 PLAY B5", "2 B8", "3 0 PLAY B8", "3 1 DRAW", "3 1 PLAY F3", "3 2 DRAW", "3 2 PLAY T6", "3 3 DRAW", "3 3 PLAY B1", "2 T6", "3 0 PLAY T6", "3 1 DRAW", "3 1 PLAY W9", "3 2 DRAW", "3 2 PLAY B8", "3 3 DRAW", "3 3 PLAY W5", "2 T6", "3 0 PLAY T6", "3 1 DRAW", "3 1 PLAY B1", "3 2 DRAW", "3 2 PLAY T6", "3 3 DRAW", "3 3 PLAY W6", "2 J2", "3 0 PLAY J2", "3 1 DRAW", "3 1 PLAY W6", "3 2 DRAW", "3 2 PLAY W8", "3 3 DRAW", "3 3 PLAY W6", "2 F1", "3 0 PLAY F1", "3 1 DRAW", "3 1 PLAY W3", "3 2 DRAW", "3 2 PLAY T7", "3 3 DRAW", "3 3 PLAY W8", "2 W2", "3 0 PLAY W2", "3 1 DRAW", "3 1 PLAY T5", "3 0 PENG W9", "3 1 DRAW", "3 1 PLAY W5", "3 2 DRAW", "3 2 PLAY J2", "3 3 DRAW", "3 3 PLAY J3", "2 B9", "3 0 PLAY W8", "3 1 DRAW", "3 1 PLAY W7", "3 2 DRAW", "3 2 PLAY T7", "3 3 DRAW", "3 3 PLAY T9", "2 T3", "3 0 PLAY W5", "3 1 DRAW", "3 1 PLAY T1", "3 2 DRAW"], ["1 0 0 0 0 F4 B4 F1 B7 B4 B9 F3 T1 T2 B6 T7 B1 F2", "2 F2", "3 1 PLAY T1", "3 2 DRAW", "3 2 PLAY T2", "3 3 DRAW", "3 3 PLAY W3", "3 0 DRAW", "3 0 PLAY T8", "2 B9", "3 1 PLAY T2", "3 2 DRAW", "3 2 PLAY W2", "3 3 DRAW", "3 3 PLAY T9", "3 0 DRAW", "3 0 PLAY B7", "2 T3", "3 1 PLAY T3", "3 2 DRAW", "3 2 PLAY J3", "3 3 DRAW", "3 3 PLAY B6", "3 0 CHI B5 W2", "2 T2", "3 1 PLAY T2", "3 2 DRAW", "3 2 PLAY J2", "3 3 DRAW", "3 3 PLAY F3", "3 0 DRAW", "3 0 PLAY W4", "2 B9", "3 1 PLAY T7", "3 2 DRAW", "3 2 PLAY B4", "3 1 PENG F3", "3 2 DRAW", "3 2 PLAY T1", "3 3 DRAW", "3 3 PLAY W1", "3 0 DRAW", "3 0 PLAY B2", "3 3 PENG F1", "3 0 DRAW", "3 0 PLAY F3", "2 W1", "3 1 PLAY W1", "3 2 DRAW", "3 2 PLAY B5", "3 3 DRAW", "3 3 PLAY J2", "3 0 DRAW", "3 0 PLAY F2", "3 1 PENG F1", "3 2 DRAW", "3 2 PLAY F2", "3 3 DRAW", "3 3 PLAY T9", "3 0 DRAW", "3 0 PLAY W4", "2 B6", "3 1 PLAY F4", "3 2 DRAW", "3 2 PLAY B2", "3 3 DRAW", "3 3 PLAY W3", "3 0 DRAW", "3 0 PLAY W9", "2 W4", "3 1 PLAY W4", "3 2 DRAW", "3 2 PLAY T1", "3 3 DRAW", "3 3 PLAY J3", "3 0 DRAW", "3 0 PLAY F4", "2 B8", "3 1 PLAY B1", "3 2 DRAW", "3 2 PLAY W2", "3 3 DRAW", "3 3 PLAY F4", "3 0 DRAW", "3 0 PLAY B1", "2 W1", "3 1 PLAY W1", "3 2 DRAW", "3 2 GANG", "3 2 DRAW", "3 2 PLAY W1", "3 3 DRAW", "3 3 PLAY F4", "3 0 DRAW", "3 0 PLAY T3", "2 J3", "3 1 PLAY J3", "3 2 DRAW", "3 2 PLAY F1", "3 3 DRAW", "3 3 PLAY T8", "3 0 DRAW", "3 0 PLAY T8", "2 W5", "3 1 PLAY W5", "3 2 DRAW", "3 2 PLAY W6", "3 3 DRAW", "3 3 PLAY B5", "3 0 DRAW", "3 0 PLAY B8", "2 F3", "3 1 PLAY F3", "3 2 DRAW", "3 2 PLAY T6", "3 3 DRAW", "3 3 PLAY B1", "3 0 DRAW", "3 0 PLAY T6", "2 W9", "3 1 PLAY W9", "3 2 DRAW", "3 2 PLAY B8", "3 3 DRAW", "3 3 PLAY W5", "3 0 DRAW", "3 0 PLAY T6", "2 B1", "3 1 PLAY B1", "3 2 DRAW", "3 2 PLAY T6", "3 3 DRAW", "3 3 PLAY W6", "3 0 DRAW", "3 0 PLAY J2", "2 W6", "3 1 PLAY W6", "3 2 DRAW", "3 2 PLAY W8", "3 3 DRAW", "3 3 PLAY W6", "3 0 DRAW", "3 0 PLAY F1", "2 W3", "3 1 PLAY W3", "3 2 DRAW", "3 2 PLAY T7", "3 3 DRAW", "3 3 PLAY W8", "3 0 DRAW", "3 0 PLAY W2", "2 T5", "3 1 PLAY T5", "3 0 PENG W9", "2 W5", "3 1 PLAY W5", "3 2 DRAW", "3 2 PLAY J2", "3 3 DRAW", "3 3 PLAY J3", "3 0 DRAW", "3 0 PLAY W8", "2 W7", "3 1 PLAY W7", "3 2 DRAW", "3 2 PLAY T7", "3 3 DRAW", "3 3 PLAY T9", "3 0 DRAW", "3 0 PLAY W5", "2 T1", "3 1 PLAY T1", "3 2 DRAW"], ["1 0 0 0 0 W8 J2 J3 B3 J1 T2 T9 T7 B8 B3 W2 W9 B8", "3 1 DRAW", "3 1 PLAY T1", "2 F2", "3 2 PLAY T2", "3 3 DRAW", "3 3 PLAY W3", "3 0 DRAW", "3 0 PLAY T8", "3 1 DRAW", "3 1 PLAY T2", "2 W7", "3 2 PLAY W2", "3 3 DRAW", "3 3 PLAY T9", "3 0 DRAW", "3 0 PLAY B7", "3 1 DRAW", "3 1 PLAY T3", "2 B3", "3 2 PLAY J3", "3 3 DRAW", "3 3 PLAY B6", "3 0 CHI B5 W2", "3 1 DRAW", "3 1 PLAY T2", "2 J1", "3 2 PLAY J2", "3 3 DRAW", "3 3 PLAY F3", "3 0 DRAW", "3 0 PLAY W4", "3 1 DRAW", "3 1 PLAY T7", "2 B4", "3 2 PLAY B4", "3 1 PENG F3", "2 T1", "3 2 PLAY T1", "3 3 DRAW", "3 3 PLAY W1", "3 0 DRAW", "3 0 PLAY B2", "3 3 PENG F1", "3 0 DRAW", "3 0 PLAY F3", "3 1 DRAW", "3 1 PLAY W1", "2 B5", "3 2 PLAY B5", "3 3 DRAW", "3 3 PLAY J2", "3 0 DRAW", "3 0 PLAY F2", "3 1 PENG F1", "2 T7", "3 2 PLAY F2", "3 3 DRAW", "3 3 PLAY T9", "3 0 DRAW", "3 0 PLAY W4", "3 1 DRAW", "3 1 PLAY F4", "2 B2", "3 2 PLAY B2", "3 3 DRAW", "3 3 PLAY W3", "3 0 DRAW", "3 0 PLAY W9", "3 1 DRAW", "3 1 PLAY W4", "2 T1", "3 2 PLAY T1", "3 3 DRAW", "3 3 PLAY J3", "3 0 DRAW", "3 0 PLAY F4", "3 1 DRAW", "3 1 PLAY B1", "2 W2", "3 2 PLAY W2", "3 3 DRAW", "3 3 PLAY F4", "3 0 DRAW", "3 0 PLAY B1", "3 1 DRAW", "3 1 PLAY W1", "2 B3", "3 2 GANG", "2 W1", "3 2 PLAY W1", "3 3 DRAW", "3 3 PLAY F4", "3 0 DRAW", "3 0 PLAY T3", "3 1 DRAW", "3 1 PLAY J3", "2 F1", "3 2 PLAY F1", "3 3 DRAW", "3 3 PLAY T8", "3 0 DRAW", "3 0 PLAY T8", "3 1 DRAW", "3 1 PLAY W5", "2 W6", "3 2 PLAY W6", "3 3 DRAW", "3 3 PLAY B5", "3 0 DRAW", "3 0 PLAY B8", "3 1 DRAW", "3 1 PLAY F3", "2 T6", "3 2 PLAY T6", "3 3 DRAW", "3 3 PLAY B1", "3 0 DRAW", "3 0 PLAY T6", "3 1 DRAW", "3 1 PLAY W9", "2 B7", "3 2 PLAY B8", "3 3 DRAW", "3 3 PLAY W5", "3 0 DRAW", "3 0 PLAY T6", "3 1 DRAW", "3 1 PLAY B1", "2 T6", "3 2 PLAY T6", "3 3 DRAW", "3 3 PLAY W6", "3 0 DRAW", "3 0 PLAY J2", "3 1 DRAW", "3 1 PLAY W6", "2 W8", "3 2 PLAY W8", "3 3 DRAW", "3 3 PLAY W6", "3 0 DRAW", "3 0 PLAY F1", "3 1 DRAW", "3 1 PLAY W3", "2 T8", "3 2 PLAY T7", "3 3 DRAW", "3 3 PLAY W8", "3 0 DRAW", "3 0 PLAY W2", "3 1 DRAW", "3 1 PLAY T5", "3 0 PENG W9", "3 1 DRAW", "3 1 PLAY W5", "2 J2", "3 2 PLAY J2", "3 3 DRAW", "3 3 PLAY J3", "3 0 DRAW", "3 0 PLAY W8", "3 1 DRAW", "3 1 PLAY W7", "2 T7", "3 2 PLAY T7", "3 3 DRAW", "3 3 PLAY T9", "3 0 DRAW", "3 0 PLAY W5", "3 1 DRAW", "3 1 PLAY T1", "2 T4"], ["1 0 0 0 0 W6 W3 F3 T4 F4 B6 T9 F1 F4 J3 B2 W6 W8", "3 1 DRAW", "3 1 PLAY T1", "3 2 DRAW", "3 2 PLAY T2", "2 B2", "3 3 PLAY W3", "3 0 DRAW", "3 0 PLAY T8", "3 1 DRAW", "3 1 PLAY T2", "3 2 DRAW", "3 2 PLAY W2", "2 T4", "3 3 PLAY T9", "3 0 DRAW", "3 0 PLAY B7", "3 1 DRAW", "3 1 PLAY T3", "3 2 DRAW", "3 2 PLAY J3", "2 W5", "3 3 PLAY B6", "3 0 CHI B5 W2", "3 1 DRAW", "3 1 PLAY T2", "3 2 DRAW", "3 2 PLAY J2", "2 W7", "3 3 PLAY F3", "3 0 DRAW", "3 0 PLAY W4", "3 1 DRAW", "3 1 PLAY T7", "3 2 DRAW", "3 2 PLAY B4", "3 1 PENG F3", "3 2 DRAW", "3 2 PLAY T1", "2 W1", "3 3 PLAY W1", "3 0 DRAW", "3 0 PLAY B2", "3 3 PENG F1", "3 0 DRAW", "3 0 PLAY F3", "3 1 DRAW", "3 1 PLAY W1", "3 2 DRAW", "3 2 PLAY B5", "2 J2", "3 3 PLAY J2", "3 0 DRAW", "3 0 PLAY F2", "3 1 PENG F1", "3 2 DRAW", "3 2 PLAY F2", "2 T9", "3 3 PLAY T9", "3 0 DRAW", "3 0 PLAY W4", "3 1 DRAW", "3 1 PLAY F4", "3 2 DRAW", "3 2 PLAY B2", "2 W3", "3 3 PLAY W3", "3 0 DRAW", "3 0 PLAY W9", "3 1 DRAW", "3 1 PLAY W4", "3 2 DRAW", "3 2 PLAY T1", "2 W7", "3 3 PLAY J3", "3 0 DRAW", "3 0 PLAY F4", "3 1 DRAW", "3 1 PLAY B1", "3 2 DRAW", "3 2 PLAY W2", "2 J1", "3 3 PLAY F4", "3 0 DRAW", "3 0 PLAY B1", "3 1 DRAW", "3 1 PLAY W1", "3 2 DRAW", "3 2 GANG", "3 2 DRAW", "3 2 PLAY W1", "2 T8", "3 3 PLAY F4", "3 0 DRAW", "3 0 PLAY T3", "3 1 DRAW", "3 1 PLAY J3", "3 2 DRAW", "3 2 PLAY F1", "2 J1", "3 3 PLAY T8", "3 0 DRAW", "3 0 PLAY T8", "3 1 DRAW", "3 1 PLAY W5", "3 2 DRAW", "3 2 PLAY W6", "2 B5", "3 3 PLAY B5", "3 0 DRAW", "3 0 PLAY B8", "3 1 DRAW", "3 1 PLAY F3", "3 2 DRAW", "3 2 PLAY T6", "2 B1", "3 3 PLAY B1", "3 0 DRAW", "3 0 PLAY T6", "3 1 DRAW", "3 1 PLAY W9", "3 2 DRAW", "3 2 PLAY B8", "2 B7", "3 3 PLAY W5", "3 0 DRAW", "3 0 PLAY T6", "3 1 DRAW", "3 1 PLAY B1", "3 2 DRAW", "3 2 PLAY T6", "2 T5", "3 3 PLAY W6", "3 0 DRAW", "3 0 PLAY J2", "3 1 DRAW", "3 1 PLAY W6", "3 2 DRAW", "3 2 PLAY W8", "2 B6", "3 3 PLAY W6", "3 0 DRAW", "3 0 PLAY F1", "3 1 DRAW", "3 1 PLAY W3", "3 2 DRAW", "3 2 PLAY T7", "2 J3", "3 3 PLAY W8", "3 0 DRAW", "3 0 PLAY W2", "3 1 DRAW", "3 1 PLAY T5", "3 0 PENG W9", "3 1 DRAW", "3 1 PLAY W5", "3 2 DRAW", "3 2 PLAY J2", "2 B5", "3 3 PLAY J3", "3 0 DRAW", "3 0 PLAY W8", "3 1 DRAW", "3 1 PLAY W7", "3 2 DRAW", "3 2 PLAY T7", "2 T9", "3 3 PLAY T9", "3 0 DRAW", "3 0 PLAY W5", "3 1 DRAW", "3 1 PLAY T1", "3 2 DRAW"]], "responses": [["PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T8", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY B7", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "CHI B5 W2", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W4", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY B2", "PASS", "PASS", "PLAY F3", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY F2", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W4", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W9", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY F4", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY B1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T3", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T8", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY B8", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T6", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T6", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY J2", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY F1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W2", "PASS", "PASS", "PENG W9", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W8", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W5", "PASS", "PASS", "PASS", "PASS"], ["PASS", "PLAY T1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T2", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T3", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T2", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T7", "PASS", "PASS", "PENG F3", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PENG F1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY F4", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W4", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY B1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY J3", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W5", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY F3", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W9", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY B1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W6", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W3", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T5", "PASS", "PASS", "PLAY W5", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W7", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T1", "PASS", "PASS"], ["PASS", "PASS", "PASS", "PLAY T2", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W2", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY J3", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY J2", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY B4", "PASS", "PASS", "PLAY T1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY B5", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY F2", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY B2", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W2", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "GANG B3", "PASS", "PLAY W1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY F1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W6", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T6", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY B8", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T6", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W8", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T7", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY J2", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T7", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T4"], ["PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W3", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T9", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY B6", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY F3", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W1", "PASS", "PASS", "PENG F1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY J2", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T9", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W3", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY J3", "PASS", "PASS", "HU", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY F4", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY F4", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T8", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY B5", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY B1", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W5", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W6", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W6", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY W8", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY J3", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS", "PLAY T9", "PASS", "PASS", "PASS", "PASS", "PASS", "PASS"]]}
-# for j in range(4):
-#     count += 1
-#     # if count < 2000:
-#     #     continue
-#     if count % 500 == 0:
-#         print(count)
-#     train_requests = round["requests"][j]
-#     first_request = '0 {} {}'.format(j, round['zhuangjia'])
-#     train_requests.insert(0, first_request)
-#     train_responses = ['PASS'] + round["responses"][j]
-#     for _request, _response in zip(train_requests, train_responses):
-#         print(_request, _response)
-#         try:
-#             my_bot.step(_request, _response, round['fname'])
-#         except Exception as e:
-#             print(e)
-#             print(round['fname'])
-#             # exit(0)
-#     my_bot.reset()
-
-# inputs = {
-# 	"requests": [
-# 		"0 3 3",
-# 		"1 0 0 0 0 W1 B1 T3 W4 B1 T8 F1 J1 W5 B3 W8 F3 W9",
-# 		"3 0 DRAW",
-# 		"3 0 PLAY F2",
-# 		"3 1 DRAW",
-# 		"3 1 PLAY F1",
-# 		"3 2 DRAW",
-# 		"3 2 PLAY F4",
-# 		"2 T1",
-# 		"3 3 PLAY F1",
-# 		"3 0 DRAW",
-# 		"3 0 PLAY J1",
-# 		"3 1 DRAW",
-# 		"3 1 PLAY F4",
-# 		"3 2 DRAW",
-# 		"3 2 PLAY W8",
-# 		"2 F4",
-# 		"3 3 PLAY F4",
-# 		"3 0 DRAW",
-# 		"3 0 PLAY F3",
-# 		"3 1 DRAW",
-# 		"3 1 PLAY J3",
-# 		"3 2 DRAW",
-# 		"3 2 PLAY W9",
-# 		"2 T9",
-# 		"3 3 PLAY F3",
-# 		"3 0 DRAW",
-# 		"3 0 PLAY W9",
-# 		"3 1 DRAW",
-# 		"3 1 PLAY J3",
-# 		"3 2 DRAW",
-# 		"3 2 PLAY W6",
-# 		"3 3 CHI W5 J1",
-# 		"3 0 DRAW",
-# 		"3 0 PLAY F2",
-# 		"3 1 DRAW",
-# 		"3 1 PLAY W9",
-# 		"3 2 DRAW",
-# 		"3 2 PLAY F4",
-# 		"2 T2",
-# 		"3 3 PLAY W9",
-# 		"3 0 DRAW",
-# 		"3 0 PLAY T3",
-# 		"3 1 DRAW",
-# 		"3 1 PLAY B8",
-# 		"3 2 DRAW",
-# 		"3 2 PLAY T7",
-# 		"3 3 CHI T8 B1",
-# 		"3 0 DRAW",
-# 		"3 0 PLAY B3",
-# 		"3 1 DRAW",
-# 		"3 1 PLAY W2",
-# 		"3 2 DRAW",
-# 		"3 2 PLAY B1",
-# 		"2 W2",
-# 		"3 3 PLAY W8",
-# 		"3 0 DRAW",
-# 		"3 0 PLAY B4",
-# 		"3 1 DRAW",
-# 		"3 1 PLAY B5",
-# 		"3 2 DRAW",
-# 		"3 2 PLAY B6",
-# 		"2 B6",
-# 		"3 3 PLAY W2",
-# 		"3 0 CHI W2 W4",
-# 		"3 1 DRAW",
-# 		"3 1 PLAY F3",
-# 		"3 2 DRAW",
-# 		"3 2 PLAY W4",
-# 		"2 T4",
-# 		"3 3 PLAY W1",
-# 		"3 0 DRAW",
-# 		"3 0 PLAY J2",
-# 		"3 1 DRAW",
-# 		"3 1 PLAY B5",
-# 		"3 2 DRAW",
-# 		"3 2 PLAY W8",
-# 		"2 W4",
-# 		"3 3 PLAY W4",
-# 		"3 0 DRAW",
-# 		"3 0 PLAY B5",
-# 		"3 1 DRAW",
-# 		"3 1 PLAY W1",
-# 		"3 2 DRAW",
-# 		"3 2 PLAY T9"
-# 	],
-# 	"responses": [
-# 		"PASS",
-# 		"PASS",
-# 		"PASS",
-# 		"PASS"
-# 	]
-# }
+    run_main()
