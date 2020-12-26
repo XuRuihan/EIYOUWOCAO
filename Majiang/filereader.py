@@ -56,6 +56,7 @@ class Reader(threading.Thread):
                 fname = file
                 flag = True
                 already_hu = False
+                draw_hua = False
                 while line:
                     # print(line)
                     line = line.strip('\n').split('\t')
@@ -93,12 +94,23 @@ class Reader(threading.Thread):
                         cards = list(map(lambda x: x.strip("'"), cards.strip('[]').split(',')))
                         if len(cards) == 14:
                             draw_card = cards[-1]
+                            hua_count = 0
                             for card in cards:
                                 if 'H' in card:
+                                    hua_count += 1
                                     draw_card = card
+                                    draw_hua = True
+                            if hua_count > 1:
+                                self.removed_hua += 1
+                                flag = False
+                                break
                             cards.remove(draw_card)
                             zhuangjia = playerID
                         else:
+                            if 'H' in ' '.join(cards):
+                                self.removed_hua += 1
+                                flag = False
+                                break
                             draw_card = None
                         request += (' '.join(cards))
                         requests[playerID].append(request)
@@ -112,6 +124,10 @@ class Reader(threading.Thread):
                         playerID = int(line[0])
                         action = line[1]
                         cards = line[2]
+                        if draw_hua and action != '补花':
+                            self.removed_hua += 1
+                            flag = False
+                            break
                         if action == '吃':
                             middel_card = list(map(lambda x: x.strip("'"), cards.strip('[]').split(',')))[1]
                             next_line = f.readline()
@@ -126,16 +142,14 @@ class Reader(threading.Thread):
                             _cards = [play_card]
                             _action = action
                         elif action == '补花':
-                            flag = False
+                            # flag = False
+                            draw_hua = False
                             for i in range(4):
-                                if 'H' in requests[i].pop():
-                                    flag = True
-                                if len(responses[i]) == 0:
-                                    print(fname)
+                                requests[i].pop()
                                 responses[i].pop()
-                            if not flag:
-                                self.removed_hua += 1
-                                break
+                            # if not flag:
+                            #     self.removed_hua += 1
+                            #     break
                             line = f.readline()
                             if not line:
                                 for i in range(4):
@@ -156,14 +170,16 @@ class Reader(threading.Thread):
                             _action = action
                             if action == '和牌':
                                 already_hu = True
+                            if action == '摸牌' or action == '补花后摸牌' or action == '杠后摸牌':
+                                if 'H' in card:
+                                    draw_hua = True
                         for i in range(4):
                             request = get_request(_action, playerID, _cards, i)
                             # print(request)
                             response = get_response(_action, playerID, _cards, i)
                             # print(response)
-                            if request is not None:
-                                # print(request)
-                                requests[i].append(request)
+
+                            requests[i].append(request)
                             if response is not None:
                                 responses[i].append(response)
 
@@ -242,13 +258,17 @@ def get_response(action, playerid, cards, myplayerid):
 
 
 if __name__ == '__main__':
+    reader = Reader(['C:\\Users\\zrf19\\Desktop\\强化学习\\麻将\\mjdata\\output2017/PLAY/2017-07-29-305.txt'], 10086)
+    reader.start()
+    reader.join()
+    reader.get_res()
     #线程数量
-    thread_num = 16
+    thread_num = 32
     thread_rounds = 4
     thread_per_round = thread_num // thread_rounds
     #起始时间
     t = []
-    folder = 'C:\\Users\\Administrator\\Desktop\\mjdata\\output2017'
+    folder = 'C:\\Users\\zrf19\\Desktop\\强化学习\\麻将\\mjdata\\output2017'
     dirs = os.listdir(folder)
     files = []
     for dir in dirs:

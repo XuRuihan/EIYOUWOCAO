@@ -10,7 +10,6 @@
 @desc:
 '''
 import json
-import random
 from MahjongGB import MahjongFanCalculator
 import torch
 import torch.optim as optim
@@ -45,7 +44,7 @@ class responses(Enum):
     PENG = 6
     CHI = 7
     need_cards = [0, 1, 0, 0, 1, 1, 0, 1]
-
+    loss_weight = [1, 2, 20, 5, 5, 5, 3, 3]
 
 class cards(Enum):
     # 饼万条
@@ -76,7 +75,7 @@ class myModel(nn.Module):
         self.card_decision_net = nn.Sequential(
             nn.Conv2d(hidden_channels[1], hidden_channels[2], 3, stride=1, padding=1),
             nn.ReLU(),
-            nn.Conv2d(hidden_channels[2], 1, (3, 1), stride=1, padding=0)
+            nn.Conv2d(hidden_channels[2], 1, (card_feat_depth, 1), stride=1, padding=0)
         )
         self.action_decision_net = nn.Sequential(
             nn.Linear(num_extra_feats + linear_length, hidden_layers_size[0]),
@@ -101,7 +100,7 @@ class myModel(nn.Module):
             return valid_card_play
         else:
             action_mask_tensor = torch.from_numpy(action_mask).to(torch.float32).to(device)
-            extra_feats_tensor = torch.from_numpy(extra_feats).to(torch.float32).to(device).unsqueeze(0)
+            extra_feats_tensor = torch.from_numpy(extra_feats).to(torch.float32).to(device)
             linear_layer = torch.cat((card_layer.view(-1), extra_feats_tensor))
             # print(linear_layer.shape)
             action_probs = self.action_decision_net(linear_layer)
@@ -123,28 +122,38 @@ class myModel(nn.Module):
         optim.step()
 
 class MahjongHandler():
-    def __init__(self, train, model_path, load_model=False, save_model=True):
+    def __init__(self, train, model_path, load_model=False, save_model=True, botzone=False):
         use_cuda = torch.cuda.is_available()
+        self.botzone = botzone
         self.device = torch.device("cuda" if use_cuda else "cpu")
-        print('using ' + str(self.device))
+        if not botzone:
+            print('using ' + str(self.device))
         self.train = train
         self.model_path = model_path
         self.load_model = load_model
         self.save_model = save_model
         self.total_cards = 34
         self.learning_rate = 1e-4
-        self.total_actions = len(responses) - 1
-        self.model = myModel(3, 1, self.total_cards, self.total_actions).to(self.device)
+        self.action_loss_weight = responses.loss_weight.value
+        self.card_loss_weight = 2
+        self.total_actions = len(responses) - 2
+        self.model = myModel(
+
+                        card_feat_depth=18,
+                        num_extra_feats=self.total_actions,
+                        num_cards=self.total_cards,
+                        num_actions=self.total_actions
+                        ).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         self.best_precision = 0
-        self.batch_size = 50
+        self.batch_size = 500
         self.print_interval = 100
-        self.save_interval = 5000
+        self.save_interval = 500
         self.round_count = 0
         self.match = np.zeros(self.total_actions)
         self.count = np.zeros(self.total_actions)
         if self.load_model:
-            checkpoint = torch.load(self.model_path)
+            checkpoint = torch.load(self.model_path, map_location=self.device)
             self.model.load_state_dict(checkpoint['model'])
             self.optimizer.load_state_dict(checkpoint['optimizer'])
             try:
@@ -158,12 +167,17 @@ class MahjongHandler():
         self.reset(True)
 
     def reset(self, initial=False):
-        self.hand_free = np.zeros(34, dtype=int)
-        self.hand_fixed = np.zeros(34, dtype=int)
-        self.history = np.zeros(34, dtype=int)
+        self.hand_free = np.zeros(self.total_cards, dtype=int)
+        self.history = np.zeros(self.total_cards, dtype=int)
+        self.player_history = np.zeros((4, self.total_cards), dtype=int)
+        self.player_on_table = np.zeros((4, self.total_cards), dtype=int)
+        self.hand_fixed = self.player_on_table[0]
+        self.player_last_play = np.zeros(4, dtype=int)
+        self.player_angang = np.zeros(4, dtype=int)
         self.fan_count = 0
         self.hand_fixed_data = []
         self.turnID = 0
+        self.tile_count = [21, 21, 21, 21]
         self.myPlayerID = 0
         self.quan = 0
         self.prev_request = ''
@@ -171,35 +185,40 @@ class MahjongHandler():
         if not initial:
             if len(self.loss) > 0:
                 self.model.train_backward(self.loss, self.optimizer)
-            if self.round_count % self.print_interval == 0:
-                precisions = self.match / self.count
-                for i in range(self.total_actions):
-                    print('{}: {}/{} {:2%}'.format(responses(i).name, self.match[i], self.count[i], precisions[i]))
-                self.match = np.zeros(self.total_actions)
-                self.count = np.zeros(self.total_actions)
-            if self.round_count % self.save_interval == 0:
-                state = {'model': self.model.state_dict(), 'optimizer': self.optimizer.state_dict(), 'progress': self.round_count}
-                torch.save(state, self.model_path, _use_new_zipfile_serialization=False)
+            if not self.botzone:
+                if self.round_count % self.print_interval == 0:
+                    precisions = self.match / self.count
+                    for i in range(self.total_actions):
+                        print('{}: {}/{} {:2%}'.format(responses(i).name, self.match[i], self.count[i], precisions[i]))
+                    self.match = np.zeros(self.total_actions)
+                    self.count = np.zeros(self.total_actions)
+                if self.round_count % self.save_interval == 0:
+                    state = {'model': self.model.state_dict(), 'optimizer': self.optimizer.state_dict(), 'progress': self.round_count}
+                    torch.save(state, self.model_path, _use_new_zipfile_serialization=False)
         self.round_count += 1
         self.loss = []
 
-    def step(self, request=None, response_target=None, fname=None, output=False):
+    def step(self, request=None, response_target=None, fname=None):
         if fname:
             self.fname = fname
         if request is None:
-            inputJSON = json.loads(input())
-            request = inputJSON['requests'].split(' ')
+            if self.turnID == 0:
+                inputJSON = json.loads(input())
+                request = inputJSON['requests'][0].split(' ')
+            else:
+                request = input().split(' ')
         else:
             request = request.split(' ')
 
         request = self.build_hand_history(request)
         if self.turnID <= 1:
-            if output:
+            if self.botzone:
                 print(json.dumps({"response": "PASS"}))
         else:
             available_action_mask, available_card_mask = self.build_available_action_mask(request)
-            card_feats = np.array([self.hand_free, self.hand_fixed, self.history])
-            extra_feats = np.array(int(available_action_mask[responses.HU.value]==1))
+            card_feats = self.build_input(self.hand_free, self.history, self.player_history,
+                                   self.player_on_table, self.player_last_play, self.player_angang)
+            extra_feats = available_action_mask
             action_probs = self.model(card_feats, self.device, extra_feats=extra_feats, action_mask=available_action_mask)
             action = int(torch.argmax(action_probs).data.cpu())
             cards = []
@@ -211,12 +230,12 @@ class MahjongHandler():
                 card_probs = available_card_mask[action]
                 card_ind = np.argmax(card_probs)
             if responses(action) in [responses.PENG, responses.CHI]:
-                card_play_probs = self.simulate_chi_peng(request, responses(action), card_feats, card_ind)
+                card_play_probs = self.simulate_chi_peng(request, responses(action), card_ind)
                 cards.append(int(torch.argmax(card_play_probs).data.cpu()))
             response = self.build_output(responses(action), cards)
             if responses(action) == responses.ANGANG:
                 self.an_gang_card = self.getCardName(cards[0])
-            if output:
+            if self.botzone:
                 print(json.dumps({"response": response}))
 
             def judge_response(available_action_mask):
@@ -225,33 +244,51 @@ class MahjongHandler():
                 return True
 
             if self.train and response_target is not None and judge_response(available_action_mask):
-                self.loss.extend(self.build_losses(action_probs, request, response_target, card_feats, available_card_mask, available_action_mask))
+                self.loss.extend(self.build_losses(action_probs, request, response_target, card_feats,
+                                                   available_card_mask, available_action_mask))
                 if len(self.loss) >= self.batch_size:
                     self.model.train_backward(self.loss, self.optimizer)
                     self.loss = []
-                resp_name = response.split(' ')[0]
-                resp_target_name = response_target.split(' ')[0]
-                if resp_target_name == 'GANG':
-                    if len(response_target.split(' ')) > 1:
-                        resp_target_name = 'ANGANG'
-                    else:
-                        resp_target_name = 'MINGGANG'
-                if resp_name == 'GANG':
-                    if len(response.split(' ')) > 1:
-                        resp_name = 'ANGANG'
-                    else:
-                        resp_name = 'MINGGANG'
-                self.count[responses[resp_target_name].value] += 1
-                if response == response_target:
-                    # hand = []
-                    # for ind, cardcnt in enumerate(self.hand_free):
-                    #     for _ in range(cardcnt):
-                    #         hand.append(self.getCardName(ind))
-                    # print(hand, request, available_action_mask)
-                    # print(response, response_target)
-                    self.match[responses[resp_name].value] += 1
+                self.build_result_summary(response, response_target)
+
         self.prev_request = request
         self.turnID += 1
+
+    def build_input(self, my_free, history, play_history, on_table, last_play, angang):
+        temp = np.array([my_free, 4 - history])
+        # total_cards = my_free + on_table[0]
+        # if total_cards.sum() < 13 or total_cards.sum() > 14:
+        #     print('wwwww', total_cards)
+        # print(play_history.sum(axis=0))
+        # cards_shown = 4 - history + my_free + on_table.sum(axis=0) + play_history.sum(axis=0)
+        # if cards_shown.max() > 5:
+        #     print(cards_shown)
+        #     print(history)
+        #     print(my_free)
+        #     print(on_table.sum(0))
+        #     print(play_history.sum(0))
+        # print(cards_shown)
+        one_hot_angang = np.eye(self.total_cards)[angang]
+        one_hot_last_play = np.eye(self.total_cards)[last_play]
+        card_feats = np.concatenate((temp, on_table, play_history, one_hot_last_play, one_hot_angang))
+        return card_feats
+
+    def build_result_summary(self, response, response_target):
+        resp_name = response.split(' ')[0]
+        resp_target_name = response_target.split(' ')[0]
+        if resp_target_name == 'GANG':
+            if len(response_target.split(' ')) > 1:
+                resp_target_name = 'ANGANG'
+            else:
+                resp_target_name = 'MINGGANG'
+        if resp_name == 'GANG':
+            if len(response.split(' ')) > 1:
+                resp_name = 'ANGANG'
+            else:
+                resp_name = 'MINGGANG'
+        self.count[responses[resp_target_name].value] += 1
+        if response == response_target:
+            self.match[responses[resp_name].value] += 1
 
     def translate_hand(self):
         hand = []
@@ -271,53 +308,55 @@ class MahjongHandler():
                 response_name = 'MINGGANG'
         if action_mask[responses[response_name].value] == 0:
             self.translate_hand()
-            print(self.fname)
+            print(response_name, self.fname)
         response_target = responses[response_name]
         requires_card = responses.need_cards.value[response_target.value]
         action_target = response_target.value
         losses = []
 
-        def build_cross_entropy_loss(probs, target):
+        def build_cross_entropy_loss(probs, target, weight):
             target_tensor = torch.tensor([target]).to(device=self.device, dtype=torch.int64)
             result_tensor = probs.unsqueeze(0)
-            loss = F.cross_entropy(result_tensor, target_tensor).to(torch.float32)
+            loss = F.cross_entropy(result_tensor, target_tensor).to(torch.float32) * weight
             # if loss.requires_grad == False:
             #     print(probs, target)
             return loss.unsqueeze(0)
 
-        losses.append(build_cross_entropy_loss(action_probs, action_target))
+        action_weight = self.action_loss_weight[responses[response_name].value]
+        losses.append(build_cross_entropy_loss(action_probs, action_target, action_weight))
         if requires_card == 1:
             card_probs = self.model(card_feats, self.device, decide_cards=True,
                                     card_mask=card_mask[responses[response_name].value])
             card_target = self.getCardInd(response[1])
-            losses.append(build_cross_entropy_loss(card_probs, card_target))
+            losses.append(build_cross_entropy_loss(card_probs, card_target, self.card_loss_weight))
         if responses[response_name] in [responses.PENG, responses.CHI]:
             if responses[response_name] == responses.CHI:
                 chi_peng_ind = self.getCardInd(response[1])
             else:
                 chi_peng_ind = self.getCardInd(request[-1])
             card_play_target = self.getCardInd(response[-1])
-            card_play_probs = self.simulate_chi_peng(request, responses[response_name], card_feats, chi_peng_ind)
-            losses.append(build_cross_entropy_loss(card_play_probs, card_play_target))
+            card_play_probs = self.simulate_chi_peng(request, responses[response_name], chi_peng_ind)
+            losses.append(build_cross_entropy_loss(card_play_probs, card_play_target, self.card_loss_weight))
         return losses
 
-    def simulate_chi_peng(self, request, response, card_feats, chi_peng_ind):
+    def simulate_chi_peng(self, request, response, chi_peng_ind):
         last_card_played = self.getCardInd(request[-1])
         available_card_play_mask = np.zeros(self.total_cards)
+        my_free, on_table = self.hand_free.copy(), self.player_on_table.copy()
         if response == responses.CHI:
-            card_feats[0][chi_peng_ind - 1:chi_peng_ind + 2] -= 1
-            card_feats[0][last_card_played] += 1
-            card_feats[2][last_card_played] -= 1
-            card_feats[1][chi_peng_ind - 1:chi_peng_ind + 2] += 1
+            my_free[chi_peng_ind - 1:chi_peng_ind + 2] -= 1
+            my_free[last_card_played] += 1
+            on_table[0][chi_peng_ind - 1:chi_peng_ind + 2] += 1
             is_chi = True
         else:
             chi_peng_ind = last_card_played
-            card_feats[0][last_card_played] -= 2
-            card_feats[2][last_card_played] -= 1
-            card_feats[1][last_card_played] += 3
+            my_free[last_card_played] -= 2
+            on_table[0][last_card_played] += 3
             is_chi = False
         self.build_available_card_mask(available_card_play_mask, responses.PLAY, last_card_played,
                                        chi_peng_ind=chi_peng_ind, is_chi=is_chi)
+        card_feats = self.build_input(my_free, self.history, self.player_history, on_table, self.player_last_play,
+                                      self.player_angang)
         card_play_probs = self.model(card_feats, self.device, decide_cards=True, card_mask=available_card_play_mask)
         return card_play_probs
 
@@ -354,6 +393,9 @@ class MahjongHandler():
             if requests(requestID) in [requests.PENG, requests.CHI, requests.PLAY]:
                 if playerID != myPlayerID:
                     for response in [responses.PENG, responses.MINGGANG, responses.CHI]:
+                        # 不是上家
+                        if response == responses.CHI and (self.myPlayerID - playerID) % 4 != 1:
+                            continue
                         self.build_available_card_mask(available_card_mask[response.value], response, last_card_ind, False)
                         if available_card_mask[response.value].sum() > 0:
                             available_action_mask[response.value] = 1
@@ -425,11 +467,19 @@ class MahjongHandler():
             available_card_mask[last_card_ind] = 1
         return available_card_mask
 
-    def judgeHu(self, last_card, playerID, isGANG, isJUEZHANG=False, isLAST=False, dianPao=False):
+    def judgeHu(self, last_card, playerID, isGANG, dianPao=False):
         hand = []
         for ind, cardcnt in enumerate(self.hand_free):
             for _ in range(cardcnt):
                 hand.append(self.getCardName(ind))
+        if self.history[self.getCardInd(last_card)] == 4:
+            isJUEZHANG = True
+        else:
+            isJUEZHANG = False
+        if sum(self.tile_count) == 0:
+            isLAST = True
+        else:
+            isLAST = False
         if not dianPao:
             hand.remove(last_card)
         try:
@@ -455,6 +505,10 @@ class MahjongHandler():
         if self.turnID == 0:
             _, myPlayerID, quan = request
             self.myPlayerID = int(myPlayerID)
+            self.other_players_id = [(self.myPlayerID - i) % 4 for i in range(4)]
+            self.player_positions = {}
+            for position, id in enumerate(self.other_players_id):
+                self.player_positions[id] = position
             self.quan = int(quan)
             return request
         # 第一轮，发牌
@@ -462,102 +516,197 @@ class MahjongHandler():
             for i in range(5, 18):
                 cardInd = self.getCardInd(request[i])
                 self.hand_free[cardInd] += 1
+                self.history[cardInd] += 1
             return request
         if int(request[0]) == 3:
             request[0] = str(requests[request[2]].value)
         elif int(request[0]) == 2:
             request.insert(1, self.myPlayerID)
+        request = self.maintain_status(request, self.hand_free, self.history, self.player_history,
+                                   self.player_on_table, self.player_last_play, self.player_angang)
+        # if requests(requestID) in [requests.drawCard, requests.DRAW]:
+        #     self.tile_count[playerID] -= 1
+        # if requests(requestID) == requests.drawCard:
+        #     self.hand_free[self.getCardInd(request[-1])] += 1
+        # elif requests(requestID) == requests.PLAY:
+        #     self.history[self.getCardInd(request[-1])] += 1
+        #     self.player_history[player_position] += 1
+        #     if playerID == myPlayerID:
+        #         self.hand_free[self.getCardInd(request[-1])] -= 1
+        # elif requests(requestID) == requests.PENG:
+        #     # 上一步一定有play
+        #     last_card_ind = self.getCardInd(self.prev_request[-1])
+        #     play_card_ind = self.getCardInd(request[-1])
+        #     self.player_on_table[player_position]
+        #     if playerID != myPlayerID:
+        #         self.history[last_card_ind] += 2
+        #         self.history[play_card_ind] += 1
+        #     else:
+        #         # 记录peng来源于哪个玩家
+        #         last_player = int(self.prev_request[1])
+        #         self.hand_fixed_data.append(('PENG', self.prev_request[-1], (last_player - myPlayerID) % 4))
+        #         self.hand_free[last_card_ind] -= 2
+        #         self.hand_fixed[last_card_ind] += 3
+        #         self.history[last_card_ind] -= 1
+        #         self.history[play_card_ind] += 1
+        #         self.hand_free[play_card_ind] -= 1
+        # elif requests(requestID) == requests.CHI:
+        #     # 上一步一定有play
+        #     last_card_ind = self.getCardInd(self.prev_request[-1])
+        #     middle_card, play_card = request[3:5]
+        #     middle_card_ind = self.getCardInd(middle_card)
+        #     play_card_ind = self.getCardInd(play_card)
+        #     if playerID != myPlayerID:
+        #         self.history[middle_card_ind-1:middle_card_ind+2] += 1
+        #         self.history[last_card_ind] -= 1
+        #         self.history[play_card_ind] += 1
+        #     else:
+        #         # CHI,中间牌名，123代表上家的牌是第几张
+        #         self.hand_fixed_data.append(('CHI', middle_card, last_card_ind - middle_card_ind + 2))
+        #         self.hand_free[middle_card_ind-1:middle_card_ind+2] -= 1
+        #         self.hand_free[last_card_ind] += 1
+        #         self.hand_fixed[middle_card_ind-1:middle_card_ind+2] += 1
+        #         self.history[last_card_ind] -= 1
+        #         self.history[play_card_ind] += 1
+        #         self.hand_free[play_card_ind] -= 1
+        # elif requests(requestID) == requests.GANG:
+        #     # 暗杠
+        #     if requests(int(self.prev_request[0])) in [requests.drawCard, requests.DRAW]:
+        #         request[2] = requests.ANGANG.name
+        #         if playerID == myPlayerID:
+        #             gangCard = self.an_gang_card
+        #             # print(gangCard)
+        #             if gangCard == '' and not self.botzone:
+        #                 print(self.prev_request)
+        #                 print(request)
+        #                 print(self.fname)
+        #             gangCardInd = self.getCardInd(gangCard)
+        #             # 记录gang来源于哪个玩家（可能来自自己，暗杠）
+        #             self.hand_fixed_data.append(('GANG', gangCard, 0))
+        #             self.hand_fixed[gangCardInd] = 4
+        #             self.hand_free[gangCardInd] = 0
+        #             self.history[gangCardInd] = 0
+        #     else:
+        #         # 明杠
+        #         gangCardInd = self.getCardInd(self.prev_request[-1])
+        #         request[2] = requests.ANGANG.name
+        #         if playerID != myPlayerID:
+        #             self.history[gangCardInd] = 4
+        #         else:
+        #             # 记录gang来源于哪个玩家
+        #             last_player = int(self.prev_request[1])
+        #             self.hand_fixed_data.append(
+        #                     ('GANG', self.prev_request[-1], (last_player - myPlayerID) % 4))
+        #             self.hand_fixed[gangCardInd] = 4
+        #             self.hand_free[gangCardInd] = 0
+        #             self.history[gangCardInd] = 0
+        # elif requests(requestID) == requests.BUGANG:
+        #     # 补杠没有在番数计算吗？？？？？
+        #     play_card_ind = self.getCardInd(request[-1])
+        #     self.history[play_card_ind] += 1
+        #     if playerID == myPlayerID:
+        #         for id, comb in enumerate(self.hand_fixed_data):
+        #             if comb[1] == request[-1]:
+        #                 self.hand_fixed_data[id][0] = 'GANG'
+        #                 break
+        #         self.hand_free[play_card_ind] -= 1
+        #         self.hand_fixed[play_card_ind] += 1
+        return request
+
+    def maintain_status(self, request, my_free, history, play_history, on_table, last_play, angang):
         requestID = int(request[0])
         playerID = int(request[1])
-        myPlayerID = self.myPlayerID
+        player_position = self.player_positions[playerID]
         if requests(requestID) == requests.drawCard:
-            self.hand_free[self.getCardInd(request[-1])] += 1
+            my_free[self.getCardInd(request[-1])] += 1
+            history[self.getCardInd(request[-1])] += 1
         elif requests(requestID) == requests.PLAY:
-            self.history[self.getCardInd(request[-1])] += 1
-            if playerID == myPlayerID:
-                self.hand_free[self.getCardInd(request[-1])] -= 1
+            play_card = self.getCardInd(request[-1])
+            play_history[player_position][play_card] += 1
+            last_play[player_position] = play_card
+            # 自己
+            if player_position == 0:
+                my_free[play_card] -= 1
+            else:
+                history[play_card] += 1
         elif requests(requestID) == requests.PENG:
             # 上一步一定有play
             last_card_ind = self.getCardInd(self.prev_request[-1])
             play_card_ind = self.getCardInd(request[-1])
-            if playerID != myPlayerID:
-                self.history[last_card_ind] += 2
-                self.history[play_card_ind] += 1
+            on_table[player_position][last_card_ind] = 3
+            play_history[player_position][play_card_ind] += 1
+            last_play[player_position] = play_card_ind
+            if player_position != 0:
+                history[last_card_ind] += 2
+                history[play_card_ind] += 1
             else:
                 # 记录peng来源于哪个玩家
-                if int(self.prev_request[1]) - myPlayerID < 0:
-                    self.hand_fixed_data.append(('PENG', self.prev_request[-1], int(self.prev_request[1]) - myPlayerID + 4))
-                else:
-                    self.hand_fixed_data.append(('PENG', self.prev_request[-1], int(self.prev_request[1]) - myPlayerID))
-                self.hand_free[last_card_ind] -= 2
-                self.hand_fixed[last_card_ind] += 3
-                self.history[last_card_ind] -= 1
-                self.history[play_card_ind] += 1
-                self.hand_free[play_card_ind] -= 1
+                last_player = int(self.prev_request[1])
+                last_player_pos = self.player_positions[last_player]
+                self.hand_fixed_data.append(('PENG', self.prev_request[-1], last_player_pos))
+                my_free[last_card_ind] -= 2
+                my_free[play_card_ind] -= 1
         elif requests(requestID) == requests.CHI:
             # 上一步一定有play
             last_card_ind = self.getCardInd(self.prev_request[-1])
             middle_card, play_card = request[3:5]
             middle_card_ind = self.getCardInd(middle_card)
             play_card_ind = self.getCardInd(play_card)
-            if playerID != myPlayerID:
-                self.history[middle_card_ind-1:middle_card_ind+2] += 1
-                self.history[last_card_ind] -= 1
-                self.history[play_card_ind] += 1
+            on_table[player_position][middle_card_ind-1:middle_card_ind+2] += 1
+            if player_position != 0:
+                history[middle_card_ind-1:middle_card_ind+2] += 1
+                history[last_card_ind] -= 1
+                history[play_card_ind] += 1
             else:
                 # CHI,中间牌名，123代表上家的牌是第几张
                 self.hand_fixed_data.append(('CHI', middle_card, last_card_ind - middle_card_ind + 2))
-                self.hand_free[middle_card_ind-1:middle_card_ind+2] -= 1
-                self.hand_free[last_card_ind] += 1
-                self.hand_fixed[middle_card_ind-1:middle_card_ind+2] += 1
-                self.history[last_card_ind] -= 1
-                self.history[play_card_ind] += 1
-                self.hand_free[play_card_ind] -= 1
+                my_free[middle_card_ind-1:middle_card_ind+2] -= 1
+                my_free[last_card_ind] += 1
+                my_free[play_card_ind] -= 1
         elif requests(requestID) == requests.GANG:
             # 暗杠
             if requests(int(self.prev_request[0])) in [requests.drawCard, requests.DRAW]:
                 request[2] = requests.ANGANG.name
-                if playerID == myPlayerID:
+                if player_position == 0:
                     gangCard = self.an_gang_card
                     # print(gangCard)
-                    if gangCard == '':
+                    if gangCard == '' and not self.botzone:
                         print(self.prev_request)
                         print(request)
                         print(self.fname)
                     gangCardInd = self.getCardInd(gangCard)
                     # 记录gang来源于哪个玩家（可能来自自己，暗杠）
                     self.hand_fixed_data.append(('GANG', gangCard, 0))
-                    self.hand_fixed[gangCardInd] = 4
-                    self.hand_free[gangCardInd] = 0
-                    self.history[gangCardInd] = 0
+                    on_table[0][gangCardInd] = 4
+                    my_free[gangCardInd] = 0
+                else:
+                    angang[player_position] += 1
             else:
                 # 明杠
                 gangCardInd = self.getCardInd(self.prev_request[-1])
-                request[2] = requests.ANGANG.name
-                if playerID != myPlayerID:
-                    self.history[gangCardInd] = 4
-                else:
+                request[2] = requests.MINGGANG.name
+                history[gangCardInd] = 4
+                on_table[player_position][gangCardInd] = 4
+                if player_position == 0:
                     # 记录gang来源于哪个玩家
-                    if int(self.prev_request[1]) - myPlayerID < 0:
-                        self.hand_fixed_data.append(
-                            ('GANG', self.prev_request[-1], int(self.prev_request[1]) - myPlayerID + 4))
-                    else:
-                        self.hand_fixed_data.append(
-                            ('GANG', self.prev_request[-1], int(self.prev_request[1]) - myPlayerID))
-                    self.hand_fixed[gangCardInd] = 4
-                    self.hand_free[gangCardInd] = 0
-                    self.history[gangCardInd] = 0
+                    last_player = int(self.prev_request[1])
+                    self.hand_fixed_data.append(
+                            ('GANG', self.prev_request[-1], self.player_positions[last_player]))
+                    my_free[gangCardInd] = 0
         elif requests(requestID) == requests.BUGANG:
-            # 补杠没有在番数计算吗？？？？？
-            play_card_ind = self.getCardInd(request[-1])
-            self.history[play_card_ind] += 1
-            if playerID == myPlayerID:
-                self.hand_free[play_card_ind] -= 1
-                self.hand_fixed[play_card_ind] += 1
+            bugang_card_ind = self.getCardInd(request[-1])
+            history[bugang_card_ind] = 4
+            on_table[player_position][bugang_card_ind] = 4
+            if player_position == 0:
+                for id, comb in enumerate(self.hand_fixed_data):
+                    if comb[1] == request[-1]:
+                        self.hand_fixed_data[id] = ('GANG', comb[1], comb[2])
+                        break
+                my_free[bugang_card_ind] = 0
         return request
 
     def build_output(self, response, cards_ind):
-        if responses.need_cards.value[response.value] == 1 or response == responses.PENG:
+        if (responses.need_cards.value[response.value] == 1 and response != responses.CHI) or response == responses.PENG:
             response_name = response.name
             if response == responses.ANGANG:
                 response_name = 'GANG'
@@ -585,10 +734,22 @@ class MahjongHandler():
         return cards(cardInd).name + str(num)
 
 def train_main():
+    # my_bot = MahjongHandler(train=True, model_path='data/naive_model', load_model=False, save_model=False)
+    # with open('training_data/Tread 10086-mini.json', 'r') as f:
+    #     round_data = json.load(f)[0]
+    #     for j in range(4):
+    #         train_requests = round_data["requests"][j]
+    #         first_request = '0 {} {}'.format(j, round_data['zhuangjia'])
+    #         train_requests.insert(0, first_request)
+    #         train_responses = ['PASS'] + round_data["responses"][j]
+    #         for _request, _response in zip(train_requests, train_responses):
+    #             my_bot.step(_request, _response, round_data['fname'])
+    #         my_bot.reset()
+
     my_bot = MahjongHandler(train=True, model_path='model_result/naive_model', load_model=True, save_model=True)
     count = 0
     restore_count = my_bot.round_count
-    restore_count = 2000
+    # restore_count = 2000
     trainning_data_files = os.listdir('training_data')
     for fname in trainning_data_files:
         with open('training_data/{}'.format(fname), 'r') as f:
@@ -616,10 +777,11 @@ def train_main():
                             # exit(0)
                     my_bot.reset()
 def run_main():
-    my_bot = MahjongHandler(train=False, model_path='data/naive_model', load_model=True, save_model=False)
-    my_bot.step(output=True)
-    print('>>>BOTZONE_REQUEST_KEEP_RUNNING<<<')
-    sys.stdout.flush()
+    my_bot = MahjongHandler(train=False, model_path='data/naive_model', load_model=True, save_model=False, botzone=True)
+    while True:
+        my_bot.step()
+        print('>>>BOTZONE_REQUEST_KEEP_RUNNING<<<')
+        sys.stdout.flush()
 
 if __name__ == '__main__':
     train_main()
