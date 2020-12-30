@@ -45,7 +45,7 @@ class responses(Enum):
     PENG = 6
     CHI = 7
     need_cards = [0, 1, 0, 0, 1, 1, 0, 1]
-    loss_weight = [1, 1, 20, 2, 2, 2, 2, 2]
+    loss_weight = [1, 1, 5, 2, 2, 2, 2, 2]
 
 class cards(Enum):
     # 饼万条
@@ -86,7 +86,7 @@ class dataManager:
             self.training[which_part] = deepcopy(doc_dict)
 
     def save_data(self, round):
-        np.save('training_data/round {}.npy'.format(round), self.doc)
+        # np.save('training_data/round {}.npy'.format(round), self.doc)
         self.reset('all')
 
 class myModel(nn.Module):
@@ -161,6 +161,7 @@ class myModel(nn.Module):
         loss.backward()
         optim.step()
 
+# 添加 牌墙无牌不能杠
 class MahjongHandler():
     def __init__(self, train, model_path, load_model=False, save_model=True, botzone=False):
         use_cuda = torch.cuda.is_available()
@@ -370,20 +371,32 @@ class MahjongHandler():
             if self.botzone:
                 print(json.dumps({"response": "PASS"}))
         else:
+
+            def make_decision(probs):
+                vals = probs.data.cpu().numpy()[0]
+                max = -1000000
+                decision = 0
+                for i, val in enumerate(vals):
+                    if val != 0 and val > max:
+                        max = val
+                        decision = i
+                return decision
+
             available_action_mask, available_card_mask = self.build_available_action_mask(request)
             card_feats = self.build_input(self.hand_free, self.history, self.player_history,
                                           self.player_on_table, self.player_last_play)
             extra_feats = np.concatenate((self.player_angang[1:], available_action_mask, [self.hand_free.sum()]))
             action_probs = self.model(np.array([card_feats]),
-                                                 np.array([extra_feats]), self.device,
-                                                 'action', np.array([available_action_mask]))
-            action = int(torch.argmax(action_probs).data.cpu())
+                                      np.array([extra_feats]), self.device,
+                                      'action', np.array([available_action_mask]))
+            action = make_decision(action_probs)
             cards = []
             if responses(action) in [responses.CHI, responses.ANGANG, responses.BUGANG]:
                 card_probs = self.model(np.array([card_feats]),
-                                                 np.array([extra_feats]), self.device,
-                                                 'chi_gang', np.array([available_card_mask[action]]))
-                cards.append(int(torch.argmax(card_probs).data.cpu()))
+                                        np.array([extra_feats]), self.device,
+                                        'chi_gang', np.array([available_card_mask[action]]))
+                card_ind = make_decision(card_probs)
+                cards.append(card_ind)
             if responses(action) in [responses.PLAY, responses.CHI, responses.PENG]:
                 if responses(action) == responses.PLAY:
                     card_mask = available_card_mask[action]
@@ -395,9 +408,9 @@ class MahjongHandler():
                     card_feats, extra_feats, card_mask = self.simulate_chi_peng(request, responses(action),
                                                                                 chi_peng_ind, True)
                 card_probs = self.model(np.array([card_feats]),
-                                                 np.array([extra_feats]), self.device,
-                                                 'play', np.array([card_mask]))
-                card_ind = int(torch.argmax(card_probs).data.cpu())
+                                        np.array([extra_feats]), self.device,
+                                        'play', np.array([card_mask]))
+                card_ind = make_decision(card_probs)
                 cards.append(card_ind)
             response = self.build_output(responses(action), cards)
             if responses(action) == responses.ANGANG:
@@ -547,6 +560,8 @@ class MahjongHandler():
         # 摸牌回合
         if requests(requestID) == requests.drawCard:
             for response in [responses.PLAY, responses.ANGANG, responses.BUGANG]:
+                if self.tile_count[self.myPlayerID] == 0 and response in [responses.ANGANG, responses.BUGANG]:
+                    continue
                 self.build_available_card_mask(available_card_mask[response.value], response, last_card_ind, True)
                 if available_card_mask[response.value].sum() > 0:
                     available_action_mask[response.value] = 1
@@ -648,7 +663,7 @@ class MahjongHandler():
             isJUEZHANG = True
         else:
             isJUEZHANG = False
-        if sum(self.tile_count) == 0:
+        if self.tile_count[(playerID + 1) % 4] == 0:
             isLAST = True
         else:
             isLAST = False
@@ -663,10 +678,11 @@ class MahjongHandler():
             if str(err) == 'ERROR_NOT_WIN':
                 return 0
             else:
-                print(hand, last_card, self.hand_fixed_data)
-                print(self.fname)
-                print(err)
-                return 0
+                if not self.botzone:
+                    print(hand, last_card, self.hand_fixed_data)
+                    print(self.fname)
+                    print(err)
+                    return 0
         else:
             fan_count = 0
             for fan in ans:
@@ -703,6 +719,8 @@ class MahjongHandler():
         requestID = int(request[0])
         playerID = int(request[1])
         player_position = self.player_positions[playerID]
+        if requests(requestID) in [requests.drawCard, requests.DRAW]:
+            self.tile_count[playerID] -= 1
         if requests(requestID) == requests.drawCard:
             my_free[self.getCardInd(request[-1])] += 1
             history[self.getCardInd(request[-1])] += 1
@@ -866,9 +884,9 @@ def train_main():
                                 # exit(0)
                         my_bot.reset()
         count = 0
-        restore_count = my_bot.round_count
+        restore_count = 0
 def run_main():
-    my_bot = MahjongHandler(train=False, model_path='data/test', load_model=True, save_model=False, botzone=True)
+    my_bot = MahjongHandler(train=False, model_path='model_result/test', load_model=True, save_model=False, botzone=True)
     while True:
         my_bot.step()
         print('>>>BOTZONE_REQUEST_KEEP_RUNNING<<<')
